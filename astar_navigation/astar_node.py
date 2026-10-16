@@ -1,6 +1,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped, Twist
 from tf2_ros import Buffer, TransformListener
@@ -27,8 +28,13 @@ class AStarNavigation(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        map_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
         self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, 10
+            OccupancyGrid, '/map', self.map_callback, map_qos
         )
         self.create_subscription(
             PoseStamped, '/goal_pose', self.goal_callback, 10
