@@ -38,6 +38,7 @@ def generate_launch_description():
                 'map': LaunchConfiguration('map'),
                 'use_sim_time': 'true',
                 'autostart': 'true',
+                'params_file': os.path.join(nav2, 'params', 'nav2_params.yaml'),
                 'use_composition': 'False',
             }.items(),
         ),
