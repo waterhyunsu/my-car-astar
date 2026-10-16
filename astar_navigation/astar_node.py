@@ -4,6 +4,7 @@ from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped, Twist
 from tf2_ros import Buffer, TransformListener
+from std_srvs.srv import SetBool
 import numpy as np
 import heapq
 import math
@@ -18,6 +19,7 @@ class AStarNavigation(Node):
         self.map_origin_x = 0.0
         self.map_origin_y = 0.0
 
+        self.emergency_stopped = False
         self.path = []
         self.path_index = 0
         self.goal_world = None
@@ -39,9 +41,28 @@ class AStarNavigation(Node):
             Path, '/astar_path', 10
         )
 
+        self.create_service(
+            SetBool, '/emergency_stop', self.emergency_stop_callback
+        )
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info('A* Navigation node started')
+
+    def emergency_stop_callback(self, request, response):
+        # Latch the stop until an explicit release; discard the old route.
+        self.emergency_stopped = request.data
+        self.path = []
+        self.path_index = 0
+        self.goal_world = None
+        self.stop_robot()
+        self.publish_path()
+        response.success = True
+        response.message = (
+            'Emergency stop engaged' if request.data
+            else 'Emergency stop released. Set a new goal to drive.'
+        )
+        self.get_logger().info(response.message)
+        return response
 
     def map_callback(self, msg):
         self.map_resolution = msg.info.resolution
@@ -63,6 +84,10 @@ class AStarNavigation(Node):
         return x, y
 
     def goal_callback(self, msg):
+        if self.emergency_stopped:
+            self.stop_robot()
+            self.get_logger().warning('Goal rejected: emergency stop engaged')
+            return
         if self.map_data is None:
             self.get_logger().warning('Map is not available')
             return
@@ -191,6 +216,9 @@ class AStarNavigation(Node):
         self.path_pub.publish(path_msg)
 
     def control_loop(self):
+        if self.emergency_stopped:
+            self.stop_robot()
+            return
         if not self.path:
             return
 
@@ -199,6 +227,7 @@ class AStarNavigation(Node):
                 'map', 'base_footprint', rclpy.time.Time()
             )
         except Exception:
+            self.stop_robot()
             return
 
         x = transform.transform.translation.x
