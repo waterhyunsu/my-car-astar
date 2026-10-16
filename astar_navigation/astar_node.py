@@ -1,7 +1,11 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.clock import Clock, ClockType
+from sensor_msgs.msg import LaserScan
+from astar_navigation.lidar_safety import front_distance
+import time
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped, Twist
 from tf2_ros import Buffer, TransformListener
@@ -20,6 +24,23 @@ class AStarNavigation(Node):
         self.map_origin_x = 0.0
         self.map_origin_y = 0.0
 
+        self.declare_parameter('stop_distance', 0.4)
+        self.declare_parameter('release_distance', 0.5)
+        self.declare_parameter('front_half_angle_deg', 20.0)
+        self.declare_parameter('scan_timeout', 1.0)
+        self.stop_distance = self.get_parameter('stop_distance').value
+        self.release_distance = self.get_parameter('release_distance').value
+        self.front_half_angle = math.radians(self.get_parameter('front_half_angle_deg').value)
+        self.scan_timeout = self.get_parameter('scan_timeout').value
+        if not (0 < self.stop_distance < self.release_distance
+                and 0 < self.front_half_angle <= math.pi
+                and self.scan_timeout > 0
+                and all(math.isfinite(v) for v in (
+                    self.stop_distance, self.release_distance,
+                    self.front_half_angle, self.scan_timeout))):
+            raise ValueError('Invalid laser safety distances, angle or timeout')
+        self.last_scan_time = None
+        self.front_distance = None
         self.emergency_stopped = False
         self.path = []
         self.path_index = 0
@@ -47,26 +68,62 @@ class AStarNavigation(Node):
             Path, '/astar_path', 10
         )
 
+        self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data
+        )
         self.create_service(
             SetBool, '/emergency_stop', self.emergency_stop_callback
         )
-        self.timer = self.create_timer(0.1, self.control_loop)
+        self.safety_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.timer = self.create_timer(0.1, self.control_loop, clock=self.safety_clock)
 
         self.get_logger().info('A* Navigation node started')
 
-    def emergency_stop_callback(self, request, response):
-        # Latch the stop until an explicit release; discard the old route.
-        self.emergency_stopped = request.data
+    def scan_is_fresh(self):
+        return (self.last_scan_time is not None
+                and time.monotonic() - self.last_scan_time <= self.scan_timeout
+                and self.front_distance is not None)
+
+    def engage_stop(self, reason):
+        was_stopped = self.emergency_stopped
+        self.emergency_stopped = True
         self.path = []
         self.path_index = 0
         self.goal_world = None
         self.stop_robot()
         self.publish_path()
-        response.success = True
-        response.message = (
-            'Emergency stop engaged' if request.data
-            else 'Emergency stop released. Set a new goal to drive.'
-        )
+        if not was_stopped:
+            self.get_logger().warning(reason)
+
+    def scan_callback(self, msg):
+        self.front_distance = front_distance(msg, self.front_half_angle)
+        self.last_scan_time = time.monotonic()
+        if self.front_distance is not None and self.front_distance <= self.stop_distance:
+            self.engage_stop(f'Laser emergency stop: {self.front_distance:.2f} m ahead')
+        elif self.front_distance is None and self.path:
+            self.engage_stop('Laser emergency stop: unusable front scan')
+
+    def emergency_stop_callback(self, request, response):
+        if request.data:
+            self.engage_stop('Manual emergency stop engaged')
+            response.success = True
+            response.message = 'Emergency stop engaged'
+        elif not self.scan_is_fresh():
+            self.engage_stop('Release denied: fresh usable scan required')
+            response.success = False
+            response.message = 'Release denied: fresh usable scan required'
+        elif self.front_distance < self.release_distance:
+            self.engage_stop('Release denied: obstacle still too close')
+            response.success = False
+            response.message = f'Release denied: front clearance must be at least {self.release_distance:.2f} m'
+        else:
+            self.emergency_stopped = False
+            self.path = []
+            self.path_index = 0
+            self.goal_world = None
+            self.stop_robot()
+            response.success = True
+            response.message = 'Emergency stop released. Set a new goal to drive.'
         self.get_logger().info(response.message)
         return response
 
@@ -90,6 +147,10 @@ class AStarNavigation(Node):
         return x, y
 
     def goal_callback(self, msg):
+        if not self.scan_is_fresh():
+            self.stop_robot()
+            self.get_logger().warning('Goal rejected: fresh usable scan required')
+            return
         if self.emergency_stopped:
             self.stop_robot()
             self.get_logger().warning('Goal rejected: emergency stop engaged')
@@ -226,6 +287,9 @@ class AStarNavigation(Node):
             self.stop_robot()
             return
         if not self.path:
+            return
+        if not self.scan_is_fresh():
+            self.engage_stop('Laser emergency stop: scan missing or stale')
             return
 
         try:
